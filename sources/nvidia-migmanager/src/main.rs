@@ -6,7 +6,7 @@ it. It is called by `nvidia-migmanager.service`.
 The binary reads its config file and based on the config, it activates/deactivates MIG
 and applies the profile according to the type of GPU present in the instance.
 
-NVIDIA MIG is currently supported only in A30, A100, H100 and H200 GPUs.
+NVIDIA MIG is supported for the GPU models recognized by this package.
 
 ## Example:
 ```toml
@@ -23,6 +23,7 @@ into 4 parts and instance with H200 into 3 parts.
 */
 
 mod mig_profile;
+mod validation;
 
 use crate::mig_profile::*;
 use argh::FromArgs;
@@ -69,6 +70,7 @@ struct Args {
 enum Subcommand {
     HandleMigManager(HandleMigManagerArgs),
     RebootIfRequired(RebootIfRequiredArgs),
+    ValidateMig(ValidateMigArgs),
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -81,17 +83,22 @@ struct RebootIfRequiredArgs {}
 #[argh(subcommand, name = "apply-mig")]
 struct HandleMigManagerArgs {}
 
+/// Validates the current hardware state against the configured MIG profile
+#[derive(FromArgs, Debug, PartialEq)]
+#[argh(subcommand, name = "validate-mig")]
+struct ValidateMigArgs {}
+
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-struct NvidiaMigConfig {
+pub(crate) struct NvidiaMigConfig {
     #[serde(default)]
-    device_partitioning_strategy: String,
+    pub(crate) device_partitioning_strategy: String,
     #[serde(default)]
-    profile: HashMap<String, String>,
+    pub(crate) profile: HashMap<String, String>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum NvidiaGpu {
+pub(crate) enum NvidiaGpu {
     A100_40GB,
     A100_80GB,
     H100_80GB,
@@ -103,6 +110,20 @@ enum NvidiaGpu {
 }
 
 impl NvidiaGpu {
+    pub(crate) fn config_key(&self) -> Option<&'static str> {
+        use NvidiaGpu::*;
+        match self {
+            A100_40GB => Some("a100.40gb"),
+            A100_80GB => Some("a100.80gb"),
+            H100_80GB => Some("h100.80gb"),
+            H200_141GB => Some("h200.141gb"),
+            B200_180GB => Some("b200.180gb"),
+            B300_269GB => Some("b300.269gb"),
+            RtxPro6000_96GB => Some("rtxpro6000.96gb"),
+            Other => None,
+        }
+    }
+
     fn is_ampere(&self) -> bool {
         use NvidiaGpu::*;
         matches!(self, A100_40GB | A100_80GB)
@@ -110,7 +131,7 @@ impl NvidiaGpu {
 }
 
 #[derive(Hash, Debug, Clone, PartialEq, Eq)]
-enum MigState {
+pub(crate) enum MigState {
     Unsupported,
     Enabled,
     Disabled,
@@ -132,9 +153,9 @@ impl MigState {
     }
 }
 
-struct MigGpu {
-    model: NvidiaGpu,
-    state: MigState,
+pub(crate) struct MigGpu {
+    pub(crate) model: NvidiaGpu,
+    pub(crate) state: MigState,
 }
 
 /// Wrapper around process::Command that adds error checking.
@@ -174,10 +195,29 @@ fn set_mig_mode(mig_enabled: bool) -> Result<()> {
     Ok(())
 }
 
+fn inventory_has_mig_devices(inventory: &str) -> bool {
+    inventory
+        .lines()
+        .any(|line| line.trim_start().starts_with("MIG "))
+}
+
+fn remove_existing_mig_instances() -> Result<()> {
+    let inventory = command(NVIDIA_SMI_PATH, ["-L"])?;
+    if !inventory_has_mig_devices(&inventory) {
+        return Ok(());
+    }
+
+    info!("Removing existing MIG compute and GPU instances ...");
+    command(NVIDIA_SMI_PATH, ["mig", "-dci"])?;
+    command(NVIDIA_SMI_PATH, ["mig", "-dgi"])?;
+    Ok(())
+}
+
 // Runs the nvidia-smi command to apply the correct MIG profile in all the GPUs
 fn set_mig_profile(profile_string: &str) -> Result<()> {
     info!("Activating MIG profile ...");
 
+    remove_existing_mig_instances()?;
     command(NVIDIA_SMI_PATH, ["mig", "-cgi", profile_string, "-C"])?;
 
     Ok(())
@@ -465,6 +505,7 @@ fn disable_mig(gpu_info: &[MigGpu]) -> Result<()> {
             });
 
     if has_enabled_mig {
+        remove_existing_mig_instances()?;
         // Disable MIG for the GPU
         set_mig_mode(false)?;
 
@@ -484,6 +525,17 @@ fn disable_mig(gpu_info: &[MigGpu]) -> Result<()> {
 }
 
 fn handle_mig_manager(mig_settings: NvidiaMigConfig, gpu_info: &[MigGpu]) -> Result<()> {
+    let inventory = command(NVIDIA_SMI_PATH, ["-L"])?;
+    match validation::validate(&mig_settings, gpu_info, &inventory) {
+        Ok(()) => {
+            info!("NVIDIA hardware already matches the requested partitioning profile.");
+            return Ok(());
+        }
+        Err(error) => {
+            info!("NVIDIA hardware requires reconciliation: {error}");
+        }
+    }
+
     if mig_settings.device_partitioning_strategy == "mig" {
         enable_mig(mig_settings, gpu_info)
     } else {
@@ -534,6 +586,10 @@ fn run() -> Result<()> {
     match args.subcommand {
         Subcommand::HandleMigManager(_) => handle_mig_manager(mig_settings, &gpu_info),
         Subcommand::RebootIfRequired(_) => reboot_if_required(),
+        Subcommand::ValidateMig(_) => {
+            let inventory = command(NVIDIA_SMI_PATH, ["-L"])?;
+            validation::validate(&mig_settings, &gpu_info, &inventory).context(error::ValidationSnafu)
+        }
     }
 }
 
@@ -599,6 +655,9 @@ mod error {
 
         #[snafu(display("NvidiaSmi command failed or has incorrect output format."))]
         NvidiaSmi {},
+
+        #[snafu(display("NVIDIA hardware profile validation failed: {}", source))]
+        Validation { source: crate::validation::ValidationError },
     }
 }
 
@@ -706,5 +765,15 @@ mod test {
         let expected_profile_string = "1g.5gb,1g.5gb,1g.5gb,1g.5gb,1g.5gb,1g.5gb,1g.5gb";
 
         assert_eq!(profile_string, expected_profile_string)
+    }
+
+    #[test]
+    fn detects_existing_mig_devices_in_inventory() {
+        let inventory = "GPU 0: NVIDIA A100 (UUID: GPU-0)\n  MIG 1g.5gb Device 0: (UUID: MIG-0)\n";
+
+        assert!(inventory_has_mig_devices(inventory));
+        assert!(!inventory_has_mig_devices(
+            "GPU 0: NVIDIA A100 (UUID: GPU-0)\n"
+        ));
     }
 }
