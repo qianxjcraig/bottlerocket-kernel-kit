@@ -6,7 +6,17 @@ it. It is called by `nvidia-migmanager.service`.
 The binary reads its config file and based on the config, it activates/deactivates MIG
 and applies the profile according to the type of GPU present in the instance.
 
-NVIDIA MIG is supported for the GPU models recognized by this package.
+The manager recognizes A100 40/80 GB, H100 80 GB, H200 141 GB, B200 180 GB,
+B300 269 GB, and RTX PRO 6000 96 GB GPUs. Unknown future MIG-capable models
+may use an explicit model/profile entry, but `validate-mig` rejects them until
+their hardware identity and geometry can be verified.
+
+`nvidia-migmanager validate-mig` fails unless the current GPU mode and every
+published MIG device exactly match the rendered configuration. It also verifies
+that no MIG devices remain when the configuration requests full-GPU mode.
+Before changing geometry or disabling MIG, the manager removes existing compute
+and GPU instances; active workloads therefore cause a safe failure instead of a
+partially applied transition.
 
 ## Example:
 ```toml
