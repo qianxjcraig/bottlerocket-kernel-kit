@@ -308,7 +308,7 @@ fn parse_inventory(output: &str) -> Result<Vec<Vec<String>>, ValidationError> {
             }
             .fail();
         };
-        gpu_inventory.push(profile.to_string());
+        gpu_inventory.push(profile.trim().to_string());
     }
 
     ensure!(!inventory.is_empty(), EmptyInventorySnafu);
@@ -351,6 +351,17 @@ mod tests {
 
         assert_eq!(
             validate(&settings, &gpus, &a100_inventory("1g.5gb", 7)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn accepts_nvidia_smi_padded_profile_columns() {
+        let settings = config(MIG_STRATEGY, &[("a100.40gb", "1g.5gb")]);
+        let gpus = [gpu(NvidiaGpu::A100_40GB, MigState::Enabled)];
+
+        assert_eq!(
+            validate(&settings, &gpus, &a100_inventory("1g.5gb     ", 7)),
             Ok(())
         );
     }
