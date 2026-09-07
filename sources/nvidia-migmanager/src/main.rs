@@ -95,6 +95,8 @@ pub(crate) struct NvidiaMigConfig {
     pub(crate) device_partitioning_strategy: String,
     #[serde(default)]
     pub(crate) profile: HashMap<String, String>,
+    #[serde(default)]
+    pub(crate) strict_validation: bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -525,6 +527,11 @@ fn disable_mig(gpu_info: &[MigGpu]) -> Result<()> {
 }
 
 fn handle_mig_manager(mig_settings: NvidiaMigConfig, gpu_info: &[MigGpu]) -> Result<()> {
+    if mig_settings.strict_validation {
+        validation::validate_configuration(&mig_settings, gpu_info)
+            .context(error::ValidationSnafu)?;
+    }
+
     let inventory = command(NVIDIA_SMI_PATH, ["-L"])?;
     match validation::validate(&mig_settings, gpu_info, &inventory) {
         Ok(()) => {
@@ -588,7 +595,8 @@ fn run() -> Result<()> {
         Subcommand::RebootIfRequired(_) => reboot_if_required(),
         Subcommand::ValidateMig(_) => {
             let inventory = command(NVIDIA_SMI_PATH, ["-L"])?;
-            validation::validate(&mig_settings, &gpu_info, &inventory).context(error::ValidationSnafu)
+            validation::validate(&mig_settings, &gpu_info, &inventory)
+                .context(error::ValidationSnafu)
         }
     }
 }
@@ -657,7 +665,9 @@ mod error {
         NvidiaSmi {},
 
         #[snafu(display("NVIDIA hardware profile validation failed: {}", source))]
-        Validation { source: crate::validation::ValidationError },
+        Validation {
+            source: crate::validation::ValidationError,
+        },
     }
 }
 
@@ -685,6 +695,7 @@ mod test {
         let expected_mig_settings = NvidiaMigConfig {
             device_partitioning_strategy: "mig".to_string(),
             profile: mig_profile,
+            strict_validation: false,
         };
 
         assert_eq!(mig_settings, expected_mig_settings)
@@ -706,6 +717,7 @@ mod test {
         let expected_mig_settings = NvidiaMigConfig {
             device_partitioning_strategy: "mig".to_string(),
             profile: mig_profile,
+            strict_validation: false,
         };
 
         assert_eq!(mig_settings, expected_mig_settings)

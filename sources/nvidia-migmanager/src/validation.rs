@@ -13,6 +13,13 @@ pub(crate) enum ValidationError {
     #[snafu(display("unsupported NVIDIA GPU model for MIG"))]
     UnsupportedMigGpu,
 
+    #[snafu(display(
+        "MIG profile '{}' is not supported for NVIDIA GPU model '{}'",
+        profile,
+        model
+    ))]
+    UnsupportedMigProfileForModel { model: String, profile: String },
+
     #[snafu(display("MIG validation does not support mixed NVIDIA GPU models"))]
     MixedGpuModels,
 
@@ -28,12 +35,7 @@ pub(crate) enum ValidationError {
     #[snafu(display("invalid explicit MIG profile '{}'", profile))]
     InvalidMigProfile { profile: String },
 
-    #[snafu(display(
-        "GPU {} has MIG state {:?}; expected {}",
-        gpu_index,
-        actual,
-        expected
-    ))]
+    #[snafu(display("GPU {} has MIG state {:?}; expected {}", gpu_index, actual, expected))]
     UnexpectedMigState {
         gpu_index: usize,
         actual: MigState,
@@ -82,12 +84,27 @@ pub(crate) enum ValidationError {
     },
 }
 
+pub(crate) fn validate_configuration(
+    settings: &NvidiaMigConfig,
+    gpu_info: &[MigGpu],
+) -> Result<(), ValidationError> {
+    ensure!(!gpu_info.is_empty(), NoGpusSnafu);
+    match settings.device_partitioning_strategy.as_str() {
+        MIG_STRATEGY => mig_configuration(settings, gpu_info).map(|_| ()),
+        FULL_GPU_STRATEGY => Ok(()),
+        strategy => InvalidPartitioningStrategySnafu {
+            strategy: strategy.to_string(),
+        }
+        .fail(),
+    }
+}
+
 pub(crate) fn validate(
     settings: &NvidiaMigConfig,
     gpu_info: &[MigGpu],
     inventory_output: &str,
 ) -> Result<(), ValidationError> {
-    ensure!(!gpu_info.is_empty(), NoGpusSnafu);
+    validate_configuration(settings, gpu_info)?;
     let inventory = parse_inventory(inventory_output)?;
     ensure!(
         inventory.len() == gpu_info.len(),
@@ -112,17 +129,7 @@ fn validate_mig(
     gpu_info: &[MigGpu],
     inventory: &[Vec<String>],
 ) -> Result<(), ValidationError> {
-    let model = gpu_info
-        .first()
-        .and_then(|gpu| gpu.model.config_key())
-        .ok_or(ValidationError::UnsupportedMigGpu)?;
-
-    ensure!(
-        gpu_info
-            .iter()
-            .all(|gpu| gpu.model.config_key() == Some(model)),
-        MixedGpuModelsSnafu
-    );
+    let (_, expected) = mig_configuration(settings, gpu_info)?;
 
     for (gpu_index, gpu) in gpu_info.iter().enumerate() {
         ensure!(
@@ -134,14 +141,6 @@ fn validate_mig(
             }
         );
     }
-
-    let requested = settings
-        .profile
-        .get(model)
-        .ok_or_else(|| ValidationError::MissingMigProfile {
-            model: model.to_string(),
-        })?;
-    let expected = expected_inventory(model, requested)?;
 
     for (gpu_index, actual) in inventory.iter().enumerate() {
         let mut actual = actual.clone();
@@ -157,6 +156,33 @@ fn validate_mig(
     }
 
     Ok(())
+}
+
+fn mig_configuration(
+    settings: &NvidiaMigConfig,
+    gpu_info: &[MigGpu],
+) -> Result<(&'static str, Vec<String>), ValidationError> {
+    let model = gpu_info
+        .first()
+        .and_then(|gpu| gpu.model.config_key())
+        .ok_or(ValidationError::UnsupportedMigGpu)?;
+
+    ensure!(
+        gpu_info
+            .iter()
+            .all(|gpu| gpu.model.config_key() == Some(model)),
+        MixedGpuModelsSnafu
+    );
+
+    let requested =
+        settings
+            .profile
+            .get(model)
+            .ok_or_else(|| ValidationError::MissingMigProfile {
+                model: model.to_string(),
+            })?;
+    let expected = expected_inventory(model, requested)?;
+    Ok((model, expected))
 }
 
 fn validate_full_gpu(
@@ -199,12 +225,23 @@ fn expected_inventory(
         .split_once("g.")
         .and_then(|(compute, memory)| {
             let memory = memory.strip_suffix("gb")?;
-            Some((compute.parse::<usize>().ok()?, memory.parse::<usize>().ok()?))
+            Some((
+                compute.parse::<usize>().ok()?,
+                memory.parse::<usize>().ok()?,
+            ))
         })
         .filter(|(compute, memory)| matches!(compute, 1 | 2 | 3 | 4 | 7) && *memory > 0)
         .ok_or_else(|| ValidationError::InvalidMigProfile {
             profile: requested_profile.to_string(),
         })?;
+
+    ensure!(
+        is_supported_profile(model, requested_profile),
+        UnsupportedMigProfileForModelSnafu {
+            model: model.to_string(),
+            profile: requested_profile.to_string(),
+        }
+    );
 
     let count = min(model_memory / profile_memory, 7 / compute_slices);
     ensure!(
@@ -217,6 +254,33 @@ fn expected_inventory(
     let mut expected = vec![requested_profile.to_string(); count];
     expected.sort();
     Ok(expected)
+}
+
+fn is_supported_profile(model: &str, profile: &str) -> bool {
+    match model {
+        "a100.40gb" => matches!(
+            profile,
+            "1g.5gb" | "1g.10gb" | "2g.10gb" | "3g.20gb" | "7g.40gb"
+        ),
+        "a100.80gb" | "h100.80gb" => matches!(
+            profile,
+            "1g.10gb" | "1g.20gb" | "2g.20gb" | "3g.40gb" | "7g.80gb"
+        ),
+        "h200.141gb" => matches!(
+            profile,
+            "1g.18gb" | "1g.35gb" | "2g.35gb" | "3g.71gb" | "7g.141gb"
+        ),
+        "b200.180gb" => matches!(
+            profile,
+            "1g.23gb" | "1g.45gb" | "2g.45gb" | "3g.90gb" | "7g.180gb"
+        ),
+        "rtxpro6000.96gb" => matches!(profile, "1g.24gb" | "2g.48gb" | "4g.96gb"),
+        "b300.269gb" => matches!(
+            profile,
+            "1g.34gb" | "1g.67gb" | "2g.67gb" | "3g.135gb" | "4g.135gb" | "7g.269gb"
+        ),
+        _ => false,
+    }
 }
 
 fn parse_inventory(output: &str) -> Result<Vec<Vec<String>>, ValidationError> {
@@ -264,6 +328,7 @@ mod tests {
                 .iter()
                 .map(|(model, profile)| (model.to_string(), profile.to_string()))
                 .collect::<HashMap<_, _>>(),
+            strict_validation: true,
         }
     }
 
@@ -273,9 +338,7 @@ mod tests {
 
     fn a100_inventory(profile: &str, count: usize) -> String {
         let devices = (0..count)
-            .map(|index| {
-                format!("  MIG {profile} Device {index}: (UUID: MIG-{index})")
-            })
+            .map(|index| format!("  MIG {profile} Device {index}: (UUID: MIG-{index})"))
             .collect::<Vec<_>>()
             .join("\n");
         format!("GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-0)\n{devices}\n")
@@ -309,6 +372,20 @@ mod tests {
             expected_inventory("a100.40gb", "5g.40gb"),
             Err(ValidationError::InvalidMigProfile {
                 profile: "5g.40gb".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_profile_incompatible_with_gpu_model_before_mutation() {
+        let settings = config(MIG_STRATEGY, &[("a100.40gb", "1g.18gb")]);
+        let gpus = [gpu(NvidiaGpu::A100_40GB, MigState::Disabled)];
+
+        assert_eq!(
+            validate_configuration(&settings, &gpus),
+            Err(ValidationError::UnsupportedMigProfileForModel {
+                model: "a100.40gb".to_string(),
+                profile: "1g.18gb".to_string(),
             })
         );
     }
@@ -370,10 +447,7 @@ mod tests {
 
         assert_eq!(
             inventory,
-            vec![
-                vec!["3g.20gb".to_string()],
-                vec!["3g.20gb".to_string()]
-            ]
+            vec![vec!["3g.20gb".to_string()], vec!["3g.20gb".to_string()]]
         );
     }
 }
